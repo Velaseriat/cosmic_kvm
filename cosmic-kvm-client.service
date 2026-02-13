@@ -1,0 +1,16 @@
+[Unit]
+Description=COSMIC KVM Daemon (Client)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cosmic-kvm-daemon --client --connect 10.0.0.10:24900 --debug
+Restart=on-failure
+RestartSec=3
+
+# Needs access to /dev/uinput for input injection
+User=root
+
+[Install]
+WantedBy=multi-user.target

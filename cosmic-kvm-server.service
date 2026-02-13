@@ -1,0 +1,18 @@
+[Unit]
+Description=COSMIC KVM Daemon (Server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cosmic-kvm-daemon --server --port 24900 --debug
+Restart=on-failure
+RestartSec=3
+
+# Needs access to /dev/input/* for input capture
+SupplementaryGroups=input
+# Run as root for /dev/input and /dev/uinput access
+User=root
+
+[Install]
+WantedBy=multi-user.target
