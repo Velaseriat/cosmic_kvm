@@ -13,6 +13,7 @@ use evdev::{
     AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent as EvdevInputEvent, Key,
     RelativeAxisType, UinputAbsSetup,
 };
+use std::os::unix::io::AsRawFd;
 
 /// uinput backend implementation
 pub struct UInputBackend {
@@ -57,6 +58,22 @@ impl UInputBackend {
             .map_err(|e| InputError::DeviceCreationFailed(e.to_string()))?
             .build()
             .map_err(|e| InputError::DeviceCreationFailed(e.to_string()))?;
+
+        // Enable autorepeat on the virtual keyboard via raw ioctl
+        // EVIOCSREP = _IOW('E', 0x03, int[2])
+        // rep[0] = delay in ms, rep[1] = period in ms
+        let fd = device.as_raw_fd();
+        let rep = [250u32, 33u32]; // [delay_ms, period_ms]
+        unsafe {
+            // EVIOCSREP ioctl number: _IOW('E', 0x03, [u32; 2])
+            let req = nix::request_code_write!(b'E', 0x03, std::mem::size_of::<[u32; 2]>());
+            let ret = libc::ioctl(fd, req, rep.as_ptr());
+            if ret < 0 {
+                tracing::warn!("Failed to set keyboard repeat rate: {}", std::io::Error::last_os_error());
+            } else {
+                tracing::info!("Set keyboard autorepeat: delay={}ms period={}ms", rep[0], rep[1]);
+            }
+        }
 
         tracing::info!("Created virtual keyboard device");
         Ok(device)
@@ -134,7 +151,20 @@ impl InputBackend for UInputBackend {
             .ok_or_else(|| InputError::EventInjectionFailed("Keyboard not initialized".into()))?;
 
         let key = Key::new(event.key as u16);
-        let value = if event.pressed { 1 } else { 0 };
+        // Use raw evdev value (0=release, 1=press, 2=repeat) if available,
+        // fall back to pressed bool for backwards compatibility
+        let value = if event.raw_value != 0 || !event.pressed {
+            event.raw_value
+        } else if event.pressed {
+            1
+        } else {
+            0
+        };
+
+        tracing::debug!(
+            "Injecting key: {:?} (code={}) value={} (raw={}, pressed={})",
+            key, event.key, value, event.raw_value, event.pressed
+        );
 
         let events = [
             EvdevInputEvent::new_now(EventType::KEY, key.code(), value),

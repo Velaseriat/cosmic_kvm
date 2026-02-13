@@ -3,17 +3,18 @@
 //! Captures local input and forwards it to connected clients
 
 use crate::capture::InputCapture;
+use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::discovery::Discovery;
 use anyhow::{Context, Result};
 use cosmic_kvm_protocol::{
-    AcceptMessage, Capabilities, ChallengeMessage, HandshakeMessage, HelloMessage, Message,
-    Payload, RejectMessage,
+    AcceptMessage, Capabilities, ChallengeMessage, ClipboardData, HandshakeMessage, HelloMessage,
+    Message, Payload, RejectMessage,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 pub struct Server {
@@ -57,6 +58,29 @@ impl Server {
             }
         });
 
+        // Start clipboard monitoring
+        let (clipboard_manager, clipboard_rx) = match ClipboardManager::new().await {
+            Ok((mgr, rx)) => (Some(Arc::new(mgr)), Some(rx)),
+            Err(e) => {
+                warn!("Clipboard sync unavailable: {}. Continuing without it.", e);
+                (None, None)
+            }
+        };
+
+        // Create a broadcast channel for clipboard changes (server -> clients)
+        let (clipboard_tx, _) = broadcast::channel::<ClipboardData>(16);
+        let clipboard_broadcast = clipboard_tx.clone();
+
+        // Spawn clipboard watcher -> broadcast forwarder
+        if let Some(mut rx) = clipboard_rx {
+            let tx = clipboard_broadcast.clone();
+            tokio::spawn(async move {
+                while let Some(data) = rx.recv().await {
+                    let _ = tx.send(data);
+                }
+            });
+        }
+
         // Start accepting client connections
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = TcpListener::bind(&addr)
@@ -75,6 +99,8 @@ impl Server {
 
                     let config = Arc::clone(&config);
                     let event_receiver_clone = Arc::clone(&event_receiver);
+                    let clipboard_rx = clipboard_broadcast.subscribe();
+                    let clipboard_mgr = clipboard_manager.clone();
 
                     // Spawn handler for this client
                     tokio::spawn(async move {
@@ -82,7 +108,7 @@ impl Server {
                         let mut client_receiver = event_receiver_clone.resubscribe();
 
                         if let Err(e) =
-                            handle_client(socket, config, &mut client_receiver).await
+                            handle_client(socket, config, &mut client_receiver, clipboard_rx, clipboard_mgr).await
                         {
                             error!("Client {} error: {}", addr, e);
                         } else {
@@ -110,6 +136,8 @@ async fn handle_client(
     stream: TcpStream,
     config: Arc<Config>,
     event_receiver: &mut broadcast::Receiver<cosmic_kvm_protocol::InputEvent>,
+    mut clipboard_rx: broadcast::Receiver<ClipboardData>,
+    clipboard_mgr: Option<Arc<ClipboardManager>>,
 ) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
 
@@ -155,6 +183,55 @@ async fn handle_client(
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("Input capture stopped");
+                        break;
+                    }
+                }
+            }
+
+            // Forward clipboard changes to client
+            clipboard_data = clipboard_rx.recv() => {
+                match clipboard_data {
+                    Ok(data) => {
+                        debug!("Sending clipboard to {}: {} ({} bytes)", peer_addr, data.mime_type, data.data.len());
+                        let message = Message::new(Payload::Clipboard(data));
+                        if let Err(e) = connection.send(&message).await {
+                            error!("Failed to send clipboard to {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        debug!("Clipboard broadcast lagged for {}", peer_addr);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
+
+            // Check for incoming messages from client (clipboard sync back)
+            msg = connection.try_receive() => {
+                match msg {
+                    Ok(Some(message)) => {
+                        match message.payload {
+                            Payload::Clipboard(data) => {
+                                debug!("Received clipboard from {}: {} ({} bytes)", peer_addr, data.mime_type, data.data.len());
+                                if let Some(ref mgr) = clipboard_mgr {
+                                    if let Err(e) = mgr.set_clipboard(&data).await {
+                                        warn!("Failed to set local clipboard: {}", e);
+                                    }
+                                }
+                            }
+                            Payload::Heartbeat => {
+                                debug!("Received heartbeat from {}", peer_addr);
+                            }
+                            _ => {
+                                debug!("Received unexpected message from {}", peer_addr);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No data available yet, that's fine
+                    }
+                    Err(e) => {
+                        error!("Error receiving from {}: {}", peer_addr, e);
                         break;
                     }
                 }
@@ -297,5 +374,59 @@ impl PlainConnection {
         full_message.extend_from_slice(&body);
 
         Ok(Message::from_bytes(&full_message)?)
+    }
+
+    /// Try to receive a message without blocking (for select! loops)
+    async fn try_receive(&mut self) -> Result<Option<Message>> {
+        use tokio::io::AsyncRead;
+
+        // Check if data is available using poll-style read
+        let mut header = [0u8; 8];
+        let stream = &mut self.stream;
+
+        // Use readable() to check if data is available
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            stream.readable(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                // Data might be available, try to read
+                match stream.try_read(&mut header) {
+                    Ok(0) => {
+                        // Connection closed
+                        anyhow::bail!("Connection closed by peer");
+                    }
+                    Ok(n) if n < 8 => {
+                        // Got partial header, read the rest
+                        self.stream.read_exact(&mut header[n..]).await?;
+                    }
+                    Ok(_) => {
+                        // Got full header
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Ok(None), // Timeout = no data
+        }
+
+        let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+        if length > cosmic_kvm_protocol::MAX_MESSAGE_SIZE {
+            anyhow::bail!("Message too large: {} bytes", length);
+        }
+
+        let mut body = vec![0u8; length];
+        self.stream.read_exact(&mut body).await?;
+
+        let mut full_message = header.to_vec();
+        full_message.extend_from_slice(&body);
+
+        Ok(Some(Message::from_bytes(&full_message)?))
     }
 }

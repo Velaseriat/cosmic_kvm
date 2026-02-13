@@ -19,9 +19,10 @@ wayland-protocols = { workspace = true, optional = true }
 
 # uinput support (optional)
 evdev = { workspace = true, optional = true }
-nix = { version = "0.29", features = ["user"], optional = true }
+nix = { version = "0.29", features = ["user", "ioctl"], optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
 default = ["uinput"]
 wayland = ["wayland-client", "wayland-protocols"]
-uinput = ["evdev", "nix"]
+uinput = ["evdev", "nix", "libc"]

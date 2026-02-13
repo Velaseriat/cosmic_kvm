@@ -24,6 +24,9 @@ pub struct KeyboardEvent {
     pub key: u32,
     /// True if pressed, false if released
     pub pressed: bool,
+    /// Raw evdev value: 0=release, 1=press, 2=repeat
+    #[serde(default)]
+    pub raw_value: i32,
     /// Modifier state
     pub modifiers: ModifierState,
 }

@@ -295,12 +295,19 @@ fn convert_event(event: &evdev::InputEvent) -> Option<InputEvent> {
                     pressed: event.value() == 1,
                 }))
             } else {
-                Some(InputEvent::Keyboard(KeyboardEvent {
-                    time,
-                    key: key.code() as u32,
-                    pressed: event.value() == 1,
-                    modifiers: ModifierState::default(), // TODO: Track modifier state
-                }))
+                // Only send press (1) and release (0), skip repeat (2)
+                // Client kernel handles its own autorepeat
+                if event.value() == 2 {
+                    None
+                } else {
+                    Some(InputEvent::Keyboard(KeyboardEvent {
+                        time,
+                        key: key.code() as u32,
+                        pressed: event.value() == 1,
+                        raw_value: event.value(),
+                        modifiers: ModifierState::default(),
+                    }))
+                }
             }
         }
         InputEventKind::RelAxis(axis) => {

@@ -8,6 +8,7 @@
 
 mod capture;
 mod client;
+mod clipboard;
 mod config;
 mod discovery;
 mod network;

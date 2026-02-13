@@ -2,6 +2,7 @@
 //!
 //! Connects to a KVM server, receives input events, and injects them locally
 
+use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use cosmic_kvm_input::InputManager;
@@ -47,10 +48,19 @@ impl Client {
         let mut input_manager = InputManager::new()
             .context("Failed to initialize input manager. Do you have permission to access /dev/uinput?")?;
 
+        // Initialize clipboard sync
+        let (clipboard_mgr, clipboard_rx) = match ClipboardManager::new().await {
+            Ok((mgr, rx)) => (Some(mgr), Some(rx)),
+            Err(e) => {
+                warn!("Clipboard sync unavailable: {}. Continuing without it.", e);
+                (None, None)
+            }
+        };
+
         info!("Input injection ready. Waiting for events from server...");
 
         // Main event loop
-        self.event_loop(&mut connection, &mut input_manager)
+        self.event_loop(&mut connection, &mut input_manager, clipboard_mgr, clipboard_rx)
             .await?;
 
         Ok(())
@@ -114,54 +124,96 @@ impl Client {
         &self,
         connection: &mut PlainConnection,
         input_manager: &mut InputManager,
+        clipboard_mgr: Option<ClipboardManager>,
+        clipboard_rx: Option<tokio::sync::mpsc::Receiver<cosmic_kvm_protocol::ClipboardData>>,
     ) -> Result<()> {
         let mut event_count = 0u64;
+        let mut clipboard_rx = clipboard_rx;
 
         loop {
-            // Receive message from server
-            let message = match connection.receive().await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!("Connection error: {}", e);
-                    break;
-                }
-            };
-
-            match message.payload {
-                Payload::Input(event) => {
-                    event_count += 1;
-
-                    // Inject the input event
-                    if let Err(e) = input_manager.inject(&event) {
-                        warn!("Failed to inject event: {}", e);
-                    } else {
-                        if event_count % 1000 == 0 {
-                            debug!("Injected {} events", event_count);
-                        }
-                    }
-                }
-                Payload::Control(control) => {
-                    use cosmic_kvm_protocol::ControlMessage;
-                    match control {
-                        ControlMessage::Disconnect => {
-                            info!("Server requested disconnect");
+            tokio::select! {
+                // Receive messages from server
+                msg = connection.receive() => {
+                    let message = match msg {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            error!("Connection error: {}", e);
                             break;
                         }
-                        ControlMessage::Error(msg) => {
-                            error!("Server error: {}", msg);
+                    };
+
+                    match message.payload {
+                        Payload::Input(event) => {
+                            event_count += 1;
+
+                            // Log ALL input events for debugging
+                            match &event {
+                                cosmic_kvm_protocol::InputEvent::Keyboard(kb) => {
+                                    info!("KB: key={} pressed={} raw={}", kb.key, kb.pressed, kb.raw_value);
+                                }
+                                cosmic_kvm_protocol::InputEvent::MouseButton(mb) => {
+                                    debug!("BTN: button={} pressed={}", mb.button, mb.pressed);
+                                }
+                                cosmic_kvm_protocol::InputEvent::MouseMove(_) => {}  // too noisy
+                                cosmic_kvm_protocol::InputEvent::MouseWheel(w) => {
+                                    debug!("WHEEL: dx={} dy={}", w.dx, w.dy);
+                                }
+                            }
+
+                            if let Err(e) = input_manager.inject(&event) {
+                                warn!("Failed to inject event: {}", e);
+                            } else if event_count % 1000 == 0 {
+                                debug!("Injected {} events", event_count);
+                            }
+                        }
+                        Payload::Clipboard(data) => {
+                            debug!("Received clipboard from server: {} ({} bytes)", data.mime_type, data.data.len());
+                            if let Some(ref mgr) = clipboard_mgr {
+                                if let Err(e) = mgr.set_clipboard(&data).await {
+                                    warn!("Failed to set local clipboard: {}", e);
+                                }
+                            }
+                        }
+                        Payload::Control(control) => {
+                            use cosmic_kvm_protocol::ControlMessage;
+                            match control {
+                                ControlMessage::Disconnect => {
+                                    info!("Server requested disconnect");
+                                    break;
+                                }
+                                ControlMessage::Error(msg) => {
+                                    error!("Server error: {}", msg);
+                                }
+                                _ => {
+                                    debug!("Received control message: {:?}", control);
+                                }
+                            }
+                        }
+                        Payload::Heartbeat => {
+                            debug!("Received heartbeat");
+                            let _ = connection.send(&Message::new(Payload::Heartbeat)).await;
                         }
                         _ => {
-                            debug!("Received control message: {:?}", control);
+                            warn!("Unexpected message: {:?}", message.payload);
                         }
                     }
                 }
-                Payload::Heartbeat => {
-                    debug!("Received heartbeat");
-                    // Send heartbeat back
-                    let _ = connection.send(&Message::new(Payload::Heartbeat)).await;
-                }
-                _ => {
-                    warn!("Unexpected message: {:?}", message.payload);
+
+                // Send local clipboard changes back to server
+                clip = async {
+                    match clipboard_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(data) = clip {
+                        debug!("Sending clipboard to server: {} ({} bytes)", data.mime_type, data.data.len());
+                        let message = Message::new(Payload::Clipboard(data));
+                        if let Err(e) = connection.send(&message).await {
+                            error!("Failed to send clipboard to server: {}", e);
+                            break;
+                        }
+                    }
                 }
             }
         }
