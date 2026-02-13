@@ -22,7 +22,7 @@ impl Discovery {
     /// Advertise this device's KVM service
     pub fn advertise(&self, device_name: &str, port: u16, device_id: &str) -> Result<()> {
         let hostname = hostname::get()?;
-        let hostname_str = hostname.to_string_lossy();
+        let hostname_str = format!("{}.local.", hostname.to_string_lossy());
 
         let mut properties = HashMap::new();
         properties.insert("device_id".to_string(), device_id.to_string());

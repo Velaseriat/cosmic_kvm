@@ -2,6 +2,8 @@
 //!
 //! Captures keyboard and mouse events from /dev/input/event* devices
 //! and converts them to protocol events for network transmission.
+//!
+//! Uses Scroll Lock as a toggle hotkey to switch between local and remote mode.
 
 use anyhow::{Context, Result};
 use cosmic_kvm_protocol::{
@@ -10,13 +12,20 @@ use cosmic_kvm_protocol::{
 };
 use evdev::{Device, EventType, InputEventKind, Key};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+
+/// The hotkey used to toggle between local and remote mode
+const TOGGLE_KEY: Key = Key::KEY_SCROLLLOCK;
 
 /// Input capture manager
 pub struct InputCapture {
     devices: Vec<Device>,
     sender: broadcast::Sender<InputEvent>,
+    /// Shared state: true = remote mode (grabbed), false = local mode (ungrabbed)
+    remote_mode: Arc<AtomicBool>,
 }
 
 impl InputCapture {
@@ -27,6 +36,7 @@ impl InputCapture {
         let capture = Self {
             devices: Vec::new(),
             sender,
+            remote_mode: Arc::new(AtomicBool::new(false)),
         };
 
         Ok((capture, receiver))
@@ -100,14 +110,17 @@ impl InputCapture {
         }
 
         info!("Starting input capture from {} devices", self.devices.len());
+        info!("Press Scroll Lock to toggle between local and remote mode");
+        info!("Currently in LOCAL mode (input stays on this machine)");
 
         // Create async tasks for each device
         let mut handles = Vec::new();
 
         for device in self.devices {
             let sender = self.sender.clone();
+            let remote_mode = Arc::clone(&self.remote_mode);
             let handle = tokio::task::spawn_blocking(move || {
-                Self::capture_device(device, sender)
+                Self::capture_device(device, sender, remote_mode)
             });
             handles.push(handle);
         }
@@ -126,30 +139,103 @@ impl InputCapture {
     fn capture_device(
         mut device: Device,
         sender: broadcast::Sender<InputEvent>,
+        remote_mode: Arc<AtomicBool>,
     ) -> Result<()> {
         let device_name = device.name().unwrap_or("unknown").to_string();
         debug!("Capturing from device: {}", device_name);
 
+        // Start ungrabbed (local mode)
+        let mut is_grabbed = false;
+
         loop {
-            // Fetch events (blocking call)
-            match device.fetch_events() {
-                Ok(events) => {
-                    for event in events {
-                        if let Some(protocol_event) = convert_event(&event) {
-                            // Send to all subscribers
-                            let _ = sender.send(protocol_event);
-                        }
-                    }
-                }
+            // Fetch events (blocking call) — collect to release borrow on device
+            let events: Vec<evdev::InputEvent> = match device.fetch_events() {
+                Ok(events) => events.collect(),
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // No events available, continue
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
                     }
                     warn!("Error reading from {}: {}", device_name, e);
                     break;
                 }
+            };
+
+            let mut toggle_requested = false;
+
+            for event in &events {
+                // Log all key events at debug level so we can diagnose
+                if let InputEventKind::Key(key) = event.kind() {
+                    debug!("[{}] Key event: {:?} value={}", device_name, key, event.value());
+
+                    // Check for toggle hotkey (key press, value=1)
+                    if key == TOGGLE_KEY && event.value() == 1 {
+                        info!("[{}] Toggle hotkey detected!", device_name);
+                        toggle_requested = true;
+                        continue;
+                    }
+                }
+
+                // Only forward events when in remote mode
+                if remote_mode.load(Ordering::Relaxed) {
+                    if let Some(protocol_event) = convert_event(event) {
+                        let _ = sender.send(protocol_event);
+                    }
+                }
+            }
+
+            // Handle toggle after processing all events (borrow on device is released)
+            if toggle_requested {
+                let was_remote = remote_mode.load(Ordering::SeqCst);
+                let new_mode = !was_remote;
+                remote_mode.store(new_mode, Ordering::SeqCst);
+
+                if new_mode {
+                    if !is_grabbed {
+                        if let Err(e) = device.grab() {
+                            warn!("Failed to grab {}: {}", device_name, e);
+                        } else {
+                            is_grabbed = true;
+                        }
+                    }
+                    info!(">> REMOTE mode: input goes to client (toggled via {})", device_name);
+                } else {
+                    if is_grabbed {
+                        if let Err(e) = device.ungrab() {
+                            warn!("Failed to ungrab {}: {}", device_name, e);
+                        } else {
+                            is_grabbed = false;
+                        }
+                    }
+                    info!("<< LOCAL mode: input stays on this machine (toggled via {})", device_name);
+                }
+            }
+
+            // Sync grab state for devices that didn't receive the toggle key
+            let should_grab = remote_mode.load(Ordering::Relaxed);
+            if should_grab && !is_grabbed {
+                if let Err(e) = device.grab() {
+                    warn!("Failed to grab {}: {}", device_name, e);
+                } else {
+                    is_grabbed = true;
+                    debug!("Grabbed {}", device_name);
+                }
+            } else if !should_grab && is_grabbed {
+                if let Err(e) = device.ungrab() {
+                    warn!("Failed to ungrab {}: {}", device_name, e);
+                } else {
+                    is_grabbed = false;
+                    debug!("Ungrabbed {}", device_name);
+                }
+            }
+        }
+
+        // Release exclusive access on exit
+        if is_grabbed {
+            if let Err(e) = device.ungrab() {
+                warn!("Failed to ungrab device {}: {}", device_name, e);
+            } else {
+                debug!("Released device: {}", device_name);
             }
         }
 
